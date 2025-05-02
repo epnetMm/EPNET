@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""
+EPNET 블록체인 채굴 명령어
+
+이 스크립트는 EPNET 블록체인 네트워크에서 코인을 채굴하는 명령줄 도구입니다.
+'Pppmine ep -<wallet_address>' 형식으로 사용합니다.
+"""
+
+import os
+import sys
+import time
+import logging
+import argparse
+import json
+import signal
+import threading
+from typing import Optional, Dict, Any, List, Tuple
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("miner")
+
+# 경로 추가
+script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(script_dir)
+
+# 필요한 모듈 임포트
+try:
+    from config import ensure_data_directory, DATA_DIR
+    from wallet import Wallet
+    from transaction import Transaction
+    from block import Block
+    from blockchain import Blockchain
+    from miner import Miner
+except ImportError as e:
+    print(f"오류: 필요한 모듈을 찾을 수 없습니다: {e}")
+    print("EPNET 블록체인이 올바르게 설치되었는지 확인하세요.")
+    sys.exit(1)
+
+
+class MiningManager:
+    """
+    채굴 관리자 클래스
+    
+    이 클래스는 채굴 프로세스를 관리하고 보상을 지정된 지갑으로 전송합니다.
+    """
+    
+    def __init__(self, reward_address: str, data_dir: Optional[str] = None):
+        """
+        채굴 관리자 초기화
+        
+        Args:
+            reward_address: 채굴 보상을 받을 지갑 주소
+            data_dir: 데이터 디렉토리 (없으면 기본값 사용)
+        """
+        self.reward_address = reward_address
+        self.data_dir = data_dir or DATA_DIR
+        
+        # 데이터 디렉토리 확인
+        ensure_data_directory()
+        
+        # 컴포넌트 초기화
+        self.wallet = None
+        self.blockchain = None
+        self.miner = None
+        
+        # 상태
+        self.running = False
+        self.blocks_mined = 0
+        self.mining_start_time = 0
+        self.last_status_time = 0
+        
+        # 종료 이벤트
+        self.stop_event = threading.Event()
+    
+    def initialize(self) -> bool:
+        """
+        채굴 관리자 초기화
+        
+        Returns:
+            성공 여부
+        """
+        try:
+            # 컴포넌트 초기화
+            self._init_components()
+            
+            return True
+        except Exception as e:
+            logger.error(f"초기화 중 오류: {e}")
+            return False
+    
+    def _init_components(self):
+        """
+        필요한 컴포넌트 초기화
+        """
+        # 지갑 초기화
+        wallet_file = os.path.join(self.data_dir, 'wallet.json')
+        self.wallet = Wallet.load_from_file(wallet_file)
+        logger.info(f"지갑이 로드되었습니다. 주소: {self.wallet.public_key}")
+        
+        # 블록체인 초기화
+        self.blockchain = Blockchain()
+        
+        # 저장된 블록체인이 있는지 확인
+        chain_file = os.path.join(self.data_dir, 'blockchain.json')
+        if os.path.exists(chain_file):
+            try:
+                with open(chain_file, 'r') as f:
+                    chain_data = json.load(f)
+                
+                # 블록체인 복원
+                if 'blocks' in chain_data:
+                    for block_data in chain_data['blocks']:
+                        block = Block.from_dict(block_data)
+                        self.blockchain.add_block(block, validate=False)
+                
+                logger.info(f"블록체인이 로드되었습니다. 높이: {self.blockchain.get_height()}")
+            except Exception as e:
+                logger.error(f"블록체인 로드 중 오류: {e}")
+                logger.info("새 블록체인으로 시작합니다.")
+        else:
+            logger.info("저장된 블록체인이 없습니다. 새 블록체인으로 시작합니다.")
+        
+        # 마이너 초기화
+        self.miner = Miner(self.blockchain, self.reward_address)
+        
+        logger.info(f"채굴 보상 주소: {self.reward_address}")
+    
+    def start_mining(self):
+        """
+        채굴 시작
+        """
+        if self.running:
+            logger.warning("이미 채굴 중입니다.")
+            return
+        
+        self.running = True
+        self.mining_start_time = time.time()
+        self.last_status_time = time.time()
+        self.blocks_mined = 0
+        
+        # 종료 이벤트 초기화
+        self.stop_event.clear()
+        
+        logger.info("채굴을 시작합니다...")
+        
+        # 채굴 스레드 시작
+        mining_thread = threading.Thread(target=self._mining_loop)
+        mining_thread.daemon = True
+        mining_thread.start()
+    
+    def stop_mining(self):
+        """
+        채굴 중지
+        """
+        if not self.running:
+            return
+        
+        logger.info("채굴을 중지합니다...")
+        self.stop_event.set()
+        self.running = False
+    
+    def _mining_loop(self):
+        """
+        채굴 루프
+        """
+        while self.running and not self.stop_event.is_set():
+            try:
+                # 새 블록 채굴
+                block = self.miner.mine_block()
+                
+                if block:
+                    # 블록체인에 추가
+                    result = self.blockchain.add_block(block)
+                    
+                    if result:
+                        self.blocks_mined += 1
+                        logger.info(f"새 블록이 채굴되었습니다! 높이: {block.index}, 해시: {block.hash}")
+                        
+                        # 블록체인 저장
+                        self._save_blockchain()
+                        
+                        # 10초마다 상태 업데이트
+                        current_time = time.time()
+                        if current_time - self.last_status_time >= 10:
+                            self._print_status()
+                            self.last_status_time = current_time
+                
+                # 중단 확인
+                if self.stop_event.is_set():
+                    break
+            
+            except KeyboardInterrupt:
+                break
+            
+            except Exception as e:
+                logger.error(f"채굴 중 오류: {e}")
+                # 잠시 대기 후 계속
+                time.sleep(5)
+        
+        self.running = False
+        logger.info("채굴이 중지되었습니다.")
+    
+    def _save_blockchain(self):
+        """
+        블록체인 저장
+        """
+        chain_file = os.path.join(self.data_dir, 'blockchain.json')
+        
+        try:
+            # 블록체인 데이터 구성
+            chain_data = {
+                'height': self.blockchain.get_height(),
+                'blocks': [block.to_dict() for block in self.blockchain.chain]
+            }
+            
+            # 파일에 저장
+            with open(chain_file, 'w') as f:
+                json.dump(chain_data, f, indent=2)
+            
+            logger.debug("블록체인이 저장되었습니다.")
+        
+        except Exception as e:
+            logger.error(f"블록체인 저장 중 오류: {e}")
+    
+    def _print_status(self):
+        """
+        채굴 상태 출력
+        """
+        if not self.running or self.mining_start_time == 0:
+            return
+        
+        # 경과 시간
+        elapsed_time = time.time() - self.mining_start_time
+        hours, remainder = divmod(int(elapsed_time), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # 해시레이트 계산
+        hashrate = self.miner.get_hashrate()
+        
+        # 블록 생성 속도
+        if elapsed_time > 0 and self.blocks_mined > 0:
+            blocks_per_hour = self.blocks_mined / (elapsed_time / 3600)
+        else:
+            blocks_per_hour = 0
+        
+        # 난이도
+        difficulty = self.blockchain.difficulty
+        
+        # 채굴한 코인
+        mined_coins = self.blocks_mined * self.miner.reward
+        
+        print(f"\n===== 채굴 상태 =====")
+        print(f"채굴 시간: {hours}시간 {minutes}분 {seconds}초")
+        print(f"채굴한 블록: {self.blocks_mined} 블록")
+        print(f"채굴한 코인: {mined_coins} EP")
+        print(f"해시레이트: {hashrate:.2f} H/s")
+        print(f"블록/시간: {blocks_per_hour:.2f}")
+        print(f"현재 난이도: {difficulty}")
+        print(f"블록체인 높이: {self.blockchain.get_height()}")
+        print(f"보상 주소: {self.reward_address}")
+        print("=====================")
+
+
+def validate_wallet_address(address: str) -> bool:
+    """
+    지갑 주소 유효성 검사
+    
+    Args:
+        address: 검사할 지갑 주소
+        
+    Returns:
+        유효하면 True, 아니면 False
+    """
+    # 간단한 검사: 16진수 문자열
+    try:
+        # 주소가 '-'로 시작하면 제거
+        if address.startswith('-'):
+            address = address[1:]
+        
+        # 16진수 변환 시도
+        int(address, 16)
+        return len(address) >= 32  # 최소 길이 검사
+    except ValueError:
+        return False
+
+
+def signal_handler(sig, frame):
+    """
+    신호 처리기
+    """
+    print("\n채굴을 중지합니다...")
+    if 'mining_manager' in globals() and mining_manager.running:
+        mining_manager.stop_mining()
+    sys.exit(0)
+
+
+def main():
+    """
+    메인 함수
+    """
+    # 명령줄 인수 파싱
+    parser = argparse.ArgumentParser(description='EPNET 블록체인 채굴')
+    parser.add_argument('command', choices=['ep'], help='채굴할 코인 (ep만 지원)')
+    parser.add_argument('wallet', help='채굴 보상을 받을 지갑 주소 (접두사 "-"가 붙은 형태)')
+    args = parser.parse_args()
+    
+    # 지갑 주소 유효성 검사
+    wallet_address = args.wallet
+    if wallet_address.startswith('-'):
+        wallet_address = wallet_address[1:]
+    
+    if not validate_wallet_address(wallet_address):
+        print("오류: 유효하지 않은 지갑 주소입니다.")
+        print("형식: Pppmine ep -<wallet_address>")
+        sys.exit(1)
+    
+    # 신호 처리기 설정
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # 채굴 관리자 초기화
+    global mining_manager
+    mining_manager = MiningManager(wallet_address)
+    
+    if not mining_manager.initialize():
+        print("채굴 관리자 초기화에 실패했습니다.")
+        sys.exit(1)
+    
+    try:
+        # 채굴 시작
+        mining_manager.start_mining()
+        
+        # 메인 스레드 유지
+        while mining_manager.running:
+            time.sleep(1)
+    
+    except KeyboardInterrupt:
+        print("\n사용자에 의해 중단되었습니다.")
+        mining_manager.stop_mining()
+    
+    except Exception as e:
+        print(f"\n오류 발생: {e}")
+        mining_manager.stop_mining()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
